@@ -27,6 +27,7 @@ add_llvm_component_library(LLVMTransformUtils
   EntryExitInstrumenter.cpp
   EscapeEnumerator.cpp
   Evaluator.cpp
+  Fcb.cpp
   FixIrreducible.cpp
   FlattenCFG.cpp
   FunctionComparator.cpp
