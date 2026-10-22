@@ -2130,6 +2130,15 @@ vectorizeAsLinalgContraction(RewriterBase &rewriter, VectorizationState &state,
     iterAttrs.push_back(vector::IteratorTypeAttr::get(ctx, vecIter));
   }
 
+  // vector.contract takes a scalar accumulator and produces a scalar result
+  // when there are no free dimensions (e.g., linalg.dot), whereas the read
+  // above yields a 0-D vector.
+  auto accVecType = dyn_cast<VectorType>(vecOperands[2].getType());
+  bool hasScalarAcc = accVecType && accVecType.getRank() == 0;
+  if (hasScalarAcc)
+    vecOperands[2] = vector::ExtractOp::create(rewriter, loc, vecOperands[2],
+                                               ArrayRef<int64_t>{});
+
   // Create contraction.
   Operation *contractOp = vector::ContractionOp::create(
       rewriter, loc, /*lhs=*/vecOperands[0],
@@ -2137,9 +2146,14 @@ vectorizeAsLinalgContraction(RewriterBase &rewriter, VectorizationState &state,
       linalgOp.getIndexingMaps(), rewriter.getArrayAttr(iterAttrs), *maybeKind);
   contractOp = state.maskOperation(rewriter, contractOp, linalgOp);
 
+  Value result = contractOp->getResult(0);
+  if (hasScalarAcc)
+    result = vector::BroadcastOp::create(
+        rewriter, loc, VectorType::get({}, result.getType()), result);
+
   // Store result.
-  Operation *write = vector::createWriteOrMaskedWrite(
-      rewriter, loc, contractOp->getResult(0), outOperand->get());
+  Operation *write = vector::createWriteOrMaskedWrite(rewriter, loc, result,
+                                                      outOperand->get());
 
   // Finalize.
   if (!write->getResults().empty())
