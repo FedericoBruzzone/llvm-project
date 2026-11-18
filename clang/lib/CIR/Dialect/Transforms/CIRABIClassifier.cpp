@@ -125,7 +125,8 @@ static llvm::Align recordUnadjustedAlign(ModuleOp modOp, cir::RecordType recTy,
 /// of a supported element type.  Also a `_Complex`, or a fixed-width vector,
 /// of a supported element type.  Everything else is reported NYI at the
 /// reject() choke point in classifySignature.
-static bool isSupportedType(mlir::Type ty, const DataLayout &dl) {
+static bool isSupportedType(mlir::Type ty, const DataLayout &dl,
+                            bool allowScalableVector = false) {
   // A pointer is only handled in the default address space (null) or an
   // already-lowered target address space.  A LangAddressSpaceAttr must be
   // lowered before this pass, so reject it rather than silently dropping it.
@@ -160,16 +161,19 @@ static bool isSupportedType(mlir::Type ty, const DataLayout &dl) {
   if (auto complexTy = dyn_cast<cir::ComplexType>(ty))
     return isSupportedType(complexTy.getElementType(), dl);
   if (auto vecTy = dyn_cast<cir::VectorType>(ty)) {
-    // A scalable vector has no fixed size, and no target that classifies
-    // through the bridge passes one yet.
-    if (vecTy.isScalable())
+    // A scalable vector has no fixed size.  It is handled only as a whole
+    // parameter or return type, and only for a target that passes one, so the
+    // recursive calls below never allow it.
+    if (vecTy.isScalable() && !allowScalableVector)
       return false;
     // mapCIRType maps a bool as a one-bit integer, so a bool vector is sized
     // one bit per element, as clang packs it.  Vectors of a _BitInt whose
     // width is not a whole number of bytes are not handled yet.
     mlir::Type elemTy = vecTy.getElementType();
     if (auto elemInt = dyn_cast<cir::IntType>(elemTy)) {
-      if (elemInt.getWidth() % 8)
+      // An SVE predicate is a scalable vector of one-bit integers.
+      bool isPredicate = vecTy.isScalable() && elemInt.getWidth() == 1;
+      if (elemInt.getWidth() % 8 && !isPredicate)
         return false;
     } else if (!isa<cir::FPTypeInterface, cir::BoolType>(elemTy)) {
       return false;
@@ -278,8 +282,7 @@ static mlir::Type abiTypeToCIR(const llvm::abi::Type *ty, MLIRContext *ctx) {
         mlir::Type elemCIR = abiTypeToCIR(vecTy->getElementType(), ctx);
         if (!elemCIR)
           return nullptr;
-        return cir::VectorType::getFixed(
-            elemCIR, vecTy->getNumElements().getFixedValue());
+        return cir::VectorType::get(elemCIR, vecTy->getNumElements());
       })
       .Case([&](const llvm::abi::ArrayType *arrTy) -> mlir::Type {
         mlir::Type elemCIR = abiTypeToCIR(arrTy->getElementType(), ctx);
@@ -375,8 +378,6 @@ static const llvm::abi::Type *mapCIRType(mlir::Type type,
             llvm::Align(cirDL.getTypeLanguageAlignment(type)));
       })
       .Case([&](cir::VectorType vecTy) {
-        // isSupportedType rejects a scalable vector, so the element count is
-        // always fixed here.
         return tb.getVectorType(
             mapCIRType(vecTy.getElementType(), typeMapper, dl, cirDL, modOp),
             vecTy.getSize(), llvm::Align(cirDL.getTypeLanguageAlignment(type)));
@@ -728,7 +729,7 @@ CIRABIClassifierCommon::classifySignature(
   bool voidRet = isa<cir::VoidType>(retCIR);
 
   auto reject = [&](mlir::Type t) -> bool {
-    if (isSupportedType(t, dl))
+    if (isSupportedType(t, dl, allowsScalableVectors()))
       return false;
     emitError() << "calling-convention lowering not yet implemented for type "
                 << t;

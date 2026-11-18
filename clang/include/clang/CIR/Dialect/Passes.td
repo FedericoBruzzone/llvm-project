@@ -266,6 +266,8 @@ def CallConvLowering : Pass<"cir-call-conv-lowering", "mlir::ModuleOp"> {
                         "MLIR test ABI target"),
              clEnumValN(cir::CallConvTarget::X86_64, "x86_64",
                         "x86_64 System V"),
+             clEnumValN(cir::CallConvTarget::AArch64, "aarch64",
+                        "AArch64 AAPCS"),
              clEnumValN(cir::CallConvTarget::AMDGPU, "amdgpu",
                         "AMDGPU"),
              clEnumValN(cir::CallConvTarget::SPIRV, "spirv", "SPIR-V")

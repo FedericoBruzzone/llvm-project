@@ -125,6 +125,10 @@ protected:
   virtual const llvm::abi::TargetInfo &
   getTargetInfo(cir::FuncOp featureSource) = 0;
 
+  /// Whether the target passes a scalable vector as a whole parameter or
+  /// return value.
+  virtual bool allowsScalableVectors() const { return false; }
+
   /// Classify \p ty, the type fetched by a `cir.va_arg`, as an unnamed
   /// argument with every argument register free.
   mlir::FailureOr<mlir::abi::ArgClassification>
@@ -169,6 +173,10 @@ createInjectedABIClassifier(const mlir::DataLayout &dl,
 std::unique_ptr<CIRABIClassifier>
 createX86_64ABIClassifier(const mlir::DataLayout &dl, mlir::ModuleOp modOp,
                           const ABIClassifierOptions &options);
+
+/// The AArch64 classifier.
+std::unique_ptr<CIRABIClassifier>
+createAArch64ABIClassifier(const mlir::DataLayout &dl, mlir::ModuleOp modOp);
 
 /// The AMDGPU classifier.
 std::unique_ptr<CIRABIClassifier>

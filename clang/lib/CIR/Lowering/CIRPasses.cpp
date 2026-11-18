@@ -27,6 +27,9 @@ static CallConvTarget getCallConvTarget(const llvm::Triple &triple) {
   // Windows is not supported.  UEFI shares its convention.
   if (triple.getArch() == llvm::Triple::x86_64 && !triple.isOSWindowsOrUEFI())
     return CallConvTarget::X86_64;
+  // Windows on Arm is not supported.  UEFI shares its convention.
+  if (triple.isAArch64() && !triple.isOSWindowsOrUEFI())
+    return CallConvTarget::AArch64;
   if (triple.isAMDGPU())
     return CallConvTarget::AMDGPU;
   return CallConvTarget::None;

@@ -146,6 +146,8 @@ createABIClassifier(cir::CallConvTarget target,
     return createTestTargetABIClassifier(dl);
   case cir::CallConvTarget::X86_64:
     return createX86_64ABIClassifier(dl, modOp, options);
+  case cir::CallConvTarget::AArch64:
+    return createAArch64ABIClassifier(dl, modOp);
   case cir::CallConvTarget::AMDGPU:
     return createAMDGPUABIClassifier(dl, modOp);
   case cir::CallConvTarget::SPIRV:
