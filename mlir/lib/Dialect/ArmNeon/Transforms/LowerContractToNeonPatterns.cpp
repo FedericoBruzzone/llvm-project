@@ -1,4 +1,4 @@
-//===- LowerContractToNeonPatterns.cpp - Contract to I8MM/BF16 --*- C++ -*-===//
+//===- LowerContractToNeonPatterns.cpp - Contract to I8MM/BF16/DotProd ----===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -7,7 +7,8 @@
 //===----------------------------------------------------------------------===//
 //
 // This file implements lowering patterns from vector.contract to operations
-// that map to instructions from the Neon FEAT_I8MM extension.
+// that map to instructions from the Neon FEAT_I8MM, FEAT_BF16 and FEAT_DotProd
+// extensions.
 //
 // TODO: There may be opportunities to unify this with a similar pattern
 // for SVE. See:
@@ -446,6 +447,193 @@ public:
   }
 };
 
+/// Lowers a `vector.contract` to `arm_neon.intr.sdot` (FEAT_DotProd).
+///
+/// There are two supported cases: (i) a matrix multiplication and (ii)
+/// a vector-matrix multiplication.
+/// For (i) the indexing maps must be (m, k), (n, k), (m, n) and for (ii) they
+/// must be (k), (n, k), (n).
+/// In both cases, N and K must be multiples of 4. LHS and RHS are sign-extended
+/// iN, N <= 8, and ACC is i32.
+class VectorContractRewriterSdot : public VectorContractRewriter {
+public:
+  LogicalResult matchAndInit(vector::ContractionOp op,
+                             PatternRewriter &rewriter) {
+    if (failed(VectorContractRewriter::matchAndInit(op, rewriter)))
+      return failure();
+
+    if (op.getKind() != vector::CombiningKind::ADD)
+      return rewriter.notifyMatchFailure(op, "combining kind is not add");
+
+    MLIRContext *ctx = op.getContext();
+    SmallVector<AffineMap> expectedMaps;
+
+    // Check for either a matrix multiplication or a vector-matrix
+    // multiplication.
+    if (op.getIteratorTypesArray().size() == 3) {
+      AffineExpr m, n, k;
+      bindDims(ctx, m, n, k);
+      expectedMaps = {AffineMap::get(3, 0, {m, k}, ctx),
+                      AffineMap::get(3, 0, {n, k}, ctx),
+                      AffineMap::get(3, 0, {m, n}, ctx)};
+    } else {
+      AffineExpr n, k;
+      bindDims(ctx, n, k);
+      expectedMaps = {AffineMap::get(2, 0, {k}, ctx),
+                      AffineMap::get(2, 0, {n, k}, ctx),
+                      AffineMap::get(2, 0, {n}, ctx)};
+    }
+    if (!llvm::equal(op.getIndexingMapsArray(), expectedMaps))
+      return rewriter.notifyMatchFailure(
+          op, "indexing maps are not (m, k), (n, k), (m, n) or (k), (n, k), "
+              "(n)");
+
+    if (dimN % 4 != 0 || dimK % 4 != 0)
+      return rewriter.notifyMatchFailure(op, "N or K is not a multiple of 4");
+
+    auto accTy = dyn_cast<VectorType>(op.getAccType());
+    if (!accTy || !accTy.getElementType().isSignlessInteger(32))
+      return rewriter.notifyMatchFailure(op,
+                                         "accumulator is not a vector of i32");
+
+    auto maybeLhs = getExtOperand<arith::ExtSIOp>(op.getLhs());
+    if (!maybeLhs)
+      return rewriter.notifyMatchFailure(
+          op, "LHS is not a sign-extended iN, N <= 8");
+    auto maybeRhs = getExtOperand<arith::ExtSIOp>(op.getRhs());
+    if (!maybeRhs)
+      return rewriter.notifyMatchFailure(
+          op, "RHS is not a sign-extended iN, N <= 8");
+
+    lhs = *maybeLhs;
+    rhs = *maybeRhs;
+    acc = op.getAcc();
+
+    // Extend inputs from iN, N < 8 to i8.
+    Location loc = op.getLoc();
+    auto lhsExtInType = cast<VectorType>(lhs.getType());
+    if (lhsExtInType.getElementTypeBitWidth() < 8)
+      lhs = extendSmallIntVector(loc, lhsExtInType, lhs, /*signExt=*/true,
+                                 rewriter);
+    auto rhsExtInType = cast<VectorType>(rhs.getType());
+    if (rhsExtInType.getElementTypeBitWidth() < 8)
+      rhs = extendSmallIntVector(loc, rhsExtInType, rhs, /*signExt=*/true,
+                                 rewriter);
+
+    iterationBounds = *op.getIterationShapeToUnroll();
+    if (iterationBounds.size() == 3)
+      subTileShape = SmallVector<int64_t>({1, 4, 4});
+    else
+      subTileShape = SmallVector<int64_t>({4, 4});
+
+    return success();
+  }
+
+  /// Example with M = 1, N = 4, K = 8, i.e., two blocks along K:
+  ///
+  ///   %res = vector.contract {...} %lhs, %rhs, %acc
+  ///     : vector<1x8xi8>, vector<4x8xi8> into vector<1x4xi32>
+  ///
+  /// The first block (K = 0..3) becomes:
+  ///
+  ///   // The 4 LHS elements, copied to each 32-bit lane.
+  ///   %l = vector.extract_strided_slice %lhs
+  ///     offsets = [0, 0], sizes = [1, 4], strides = [1, 1]
+  ///     : vector<1x8xi8> to vector<1x4xi8>
+  ///   %l1 = vector.shape_cast %l : vector<1x4xi8> to vector<4xi8>
+  ///   %l2 = vector.bitcast %l1 : vector<4xi8> to vector<1xi32>
+  ///   %l3 = vector.broadcast %l2 : vector<1xi32> to vector<4xi32>
+  ///   %l4 = vector.bitcast %l3 : vector<4xi32> to vector<16xi8>
+  ///   // The 4x4 RHS block, one row (one N) per 32-bit lane.
+  ///   %r = vector.extract_strided_slice %rhs
+  ///     offsets = [0, 0], sizes = [4, 4], strides = [1, 1]
+  ///     : vector<4x8xi8> to vector<4x4xi8>
+  ///   %r1 = vector.shape_cast %r : vector<4x4xi8> to vector<16xi8>
+  ///   // Lane i: %a[i] + dot(%r[i, 0..3], %l[0, 0..3]).
+  ///   %a = vector.shape_cast %acc : vector<1x4xi32> to vector<4xi32>
+  ///   %s0 = arm_neon.intr.sdot %a, %r1, %l4
+  ///     : vector<16xi8>, vector<16xi8> to vector<4xi32>
+  ///
+  /// The second block (K = 4..7) repeats this with offsets [0, 4] and
+  /// accumulates into %s0 instead of %a. Its result, cast back to
+  /// vector<1x4xi32>, is %res.
+  void lower(vector::ContractionOp op, PatternRewriter &rewriter) {
+    Location loc = op.getLoc();
+    Type i8Ty = rewriter.getI8Type();
+    Type i32Ty = rewriter.getI32Type();
+    auto lhsGroupType = VectorType::get({4}, i8Ty);
+    auto lhsGroupAsI32Type = VectorType::get({1}, i32Ty);
+    auto collapsedInputType = VectorType::get({16}, i8Ty);
+    auto collapsedOutputType = VectorType::get({4}, i32Ty);
+
+    auto indexingMaps = op.getIndexingMapsArray();
+    AffineMap lhsPermutationMap = indexingMaps[0];
+    AffineMap rhsPermutationMap = indexingMaps[1];
+    AffineMap accPermutationMap = indexingMaps[2];
+
+    Value result =
+        arith::ConstantOp::create(rewriter, loc, op.getResultType(),
+                                  rewriter.getZeroAttr(op.getResultType()));
+
+    // K innermost, so that the sub-tiles along K of one ACC sub-tile are
+    // consecutive and chain through `kAcc`.
+    SmallVector<int64_t, 3> loopOrder = {0, 1};
+    if (iterationBounds.size() == 3)
+      loopOrder.push_back(2);
+
+    Value kAcc;
+    for (SmallVector<int64_t> offsets :
+         StaticTileOffsetRange(iterationBounds, subTileShape, loopOrder)) {
+      auto extractOperand = [&](Value operand, AffineMap permutationMap) {
+        SmallVector<int64_t> operandOffsets =
+            applyPermutationMap(permutationMap, ArrayRef<int64_t>(offsets));
+        SmallVector<int64_t> operandShape = applyPermutationMap(
+            permutationMap, ArrayRef<int64_t>(subTileShape));
+        SmallVector<int64_t> operandStrides(operandOffsets.size(), 1);
+        return rewriter.createOrFold<vector::ExtractStridedSliceOp>(
+            loc, operand, operandOffsets, operandShape, operandStrides);
+      };
+
+      Value tiledLhs = extractOperand(lhs, lhsPermutationMap);
+      Value tiledRhs = extractOperand(rhs, rhsPermutationMap);
+      Value tiledAcc = extractOperand(acc, accPermutationMap);
+
+      // Replicate the four LHS elements to the four 32-bit lanes, so that each
+      // of the four dot products of SDOT uses the same LHS group. Going
+      // through i32 lets the backend select the indexed form of SDOT.
+      Value lhsGroup = rewriter.createOrFold<vector::ShapeCastOp>(
+          loc, lhsGroupType, tiledLhs);
+      Value lhsGroupAsI32 =
+          vector::BitCastOp::create(rewriter, loc, lhsGroupAsI32Type, lhsGroup);
+      Value broadcastLhs = vector::BroadcastOp::create(
+          rewriter, loc, collapsedOutputType, lhsGroupAsI32);
+      Value collapsedLhs = vector::BitCastOp::create(
+          rewriter, loc, collapsedInputType, broadcastLhs);
+      Value collapsedRhs = rewriter.createOrFold<vector::ShapeCastOp>(
+          loc, collapsedInputType, tiledRhs);
+
+      Value collapsedAcc = offsets.back() == 0
+                               ? rewriter.createOrFold<vector::ShapeCastOp>(
+                                     loc, collapsedOutputType, tiledAcc)
+                               : kAcc;
+
+      kAcc = arm_neon::SdotOp::create(rewriter, loc, collapsedOutputType,
+                                      collapsedAcc, collapsedRhs, collapsedLhs);
+
+      Value tiledRes = rewriter.createOrFold<vector::ShapeCastOp>(
+          loc, tiledAcc.getType(), kAcc);
+      SmallVector<int64_t> accOffsets =
+          applyPermutationMap(accPermutationMap, ArrayRef<int64_t>(offsets));
+      SmallVector<int64_t> strides(
+          cast<ShapedType>(tiledRes.getType()).getRank(), 1);
+      result = rewriter.createOrFold<vector::InsertStridedSliceOp>(
+          loc, tiledRes, result, accOffsets, strides);
+    }
+
+    rewriter.replaceOp(op, result);
+  }
+};
+
 /// Lowering from a vector::contractOp arm neon smmla intrinsic. This will tile
 /// any vector.contract into multiple smmla instructions with unrolling so long
 /// as [2,2,8] is a divisor of its shape. It can also process vecmats with dimM
@@ -489,6 +677,24 @@ public:
   }
 };
 
+class LowerContractionToNeonSdotPattern
+    : public OpRewritePattern<vector::ContractionOp> {
+public:
+  using Base::Base;
+  LogicalResult matchAndRewrite(vector::ContractionOp op,
+                                PatternRewriter &rewriter) const override {
+    if (cast<vector::MaskableOpInterface>(op.getOperation()).isMasked())
+      return rewriter.notifyMatchFailure(
+          op, "masked contractions are not supported");
+
+    VectorContractRewriterSdot vcr;
+    if (failed(vcr.matchAndInit(op, rewriter)))
+      return failure();
+    vcr.lower(op, rewriter);
+
+    return success();
+  }
+};
 } // namespace
 
 void mlir::arm_neon::populateLowerContractionToNeonI8MMPatterns(
@@ -501,4 +707,10 @@ void mlir::arm_neon::populateLowerContractionToNeonBFMMLAPatterns(
     RewritePatternSet &patterns) {
   MLIRContext *context = patterns.getContext();
   patterns.add<LowerContractionToNeonBFMMLAPattern>(context, /*benefit=*/2);
+}
+
+void mlir::arm_neon::populateLowerContractionToNeonSdotPatterns(
+    RewritePatternSet &patterns) {
+  MLIRContext *context = patterns.getContext();
+  patterns.add<LowerContractionToNeonSdotPattern>(context, /*benefit=*/2);
 }

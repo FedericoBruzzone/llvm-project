@@ -28,6 +28,11 @@ void transform::ApplyArmNeonContractionToBFMMLAPatternsOp::populatePatterns(
   arm_neon::populateLowerContractionToNeonBFMMLAPatterns(patterns);
 }
 
+void transform::ApplyArmNeonContractionToSdotPatternsOp::populatePatterns(
+    RewritePatternSet &patterns) {
+  arm_neon::populateLowerContractionToNeonSdotPatterns(patterns);
+}
+
 //===----------------------------------------------------------------------===//
 // Transform op registration
 //===----------------------------------------------------------------------===//

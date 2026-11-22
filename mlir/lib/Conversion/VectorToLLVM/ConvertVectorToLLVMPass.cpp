@@ -104,6 +104,10 @@ void ConvertVectorToLLVMPass::runOnOperation() {
       if (armSVE)
         arm_sve::populateLowerContractionToSVEBFMMLAPatterns(patterns);
     }
+    // Added after the I8MM patterns: with the same benefit, SMMLA is tried
+    // first when both extensions are enabled.
+    if (armDotProd && armNeon)
+      arm_neon::populateLowerContractionToNeonSdotPatterns(patterns);
     (void)applyPatternsGreedily(getOperation(), std::move(patterns));
   }
 

@@ -1771,6 +1771,10 @@ def ConvertVectorToLLVMPass : Pass<"convert-vector-to-llvm"> {
            "bool", /*default=*/"false",
            "Enables the use of Arm FEAT_BF16 instructions while lowering "
            "the vector dialect.">,
+    Option<"armDotProd", "enable-arm-dotprod",
+           "bool", /*default=*/"false",
+           "Enables the use of Arm FEAT_DotProd instructions while lowering "
+           "the vector dialect.">,
     Option<"x86", "enable-x86",
            "bool", /*default=*/"false",
            "Enables the use of X86 dialect while lowering the vector dialect.">,

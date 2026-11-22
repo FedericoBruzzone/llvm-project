@@ -35,4 +35,16 @@ def ApplyArmNeonContractionToBFMMLAPatternsOp
   let assemblyFormat = "attr-dict";
 }
 
+def ApplyArmNeonContractionToSdotPatternsOp
+    : Op<Transform_Dialect, "apply_patterns.arm_neon.vector_contract_to_sdot",
+         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let description = [{
+    Indicates that vector contract operations should be lowered to
+    ArmNeon dialect operations mapping to the SDOT instruction from
+    FEAT_DotProd.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
 #endif // ARM_NEON_VECTOR_TRANSFORM_OPS
